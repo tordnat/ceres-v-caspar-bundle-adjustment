@@ -19,23 +19,24 @@
 #include <ceres/loss_function.h>
 #include <ceres/rotation.h>
 #include <ceres/types.h>
+#include <solver_params.h>
 #include <sophus/so3.hpp>
 #include <stdio.h>
 
 #define SPHERE_RADIUS 4
-#define MEAN_POSE_DIST 3 * SPHERE_RADIUS
+#define MEAN_POSE_DIST 4 * SPHERE_RADIUS
 
 #define POINT_NOISE_MEAN 0.03
-#define POINT_NOISE_STD 0.01
+#define POINT_NOISE_STD 0.1
 
 #define TRANSLATION_NOISE_MEAN 0.0
 #define TRANSLATION_NOISE_STD 0.03
 
 #define ROTATION_NOISE_MEAN 0.0
-#define ROTATION_NOISE_STD 0.02
+#define ROTATION_NOISE_STD 0.00
 
 #define PIXEL_NOISE_MEAN 0.0
-#define PIXEL_NOISE_STD 0.2  // 1-2 px typical, so this is low
+#define PIXEL_NOISE_STD 0  // 0.2  // 1-2 px typical, so this is low
 
 std::vector<Eigen::Vector3d> generate_points_on_sphere(
     const size_t num_samples) {
@@ -50,27 +51,30 @@ std::vector<Eigen::Isometry3d> generate_cam_pose(const size_t num_poses) {
   std::vector<Eigen::Isometry3d> sample_poses(num_poses);
   std::random_device rd;
   std::mt19937 gen(rd());
-  std::normal_distribution<double> dist(MEAN_POSE_DIST, TRANSLATION_NOISE_STD);
+  std::normal_distribution<double> dist_distance(MEAN_POSE_DIST,
+                                                 TRANSLATION_NOISE_STD);
+  std::uniform_real_distribution<double> dist_dir(-1, 1);
 
   for (Eigen::Isometry3d& pose : sample_poses) {
     pose.setIdentity();
 
-    // Position camera
-    Eigen::Vector3d cam_position =
-        Eigen::Vector3d::Random().normalized() * dist(gen);
+    Eigen::Vector3d cam_dir;
+    cam_dir.x() = dist_dir(gen);
+    cam_dir.y() = dist_dir(gen);
+    cam_dir.normalize();
+    cam_dir.z() = 0;
+    pose.translation() = cam_dir * dist_distance(gen);
 
-    // Make camera look at origin
-    Eigen::Vector3d z_axis =
-        -cam_position.normalized();  // Camera looks toward origin
-    Eigen::Vector3d up(0, 0, 1);
-    Eigen::Vector3d x_axis = up.cross(z_axis).normalized();
-    Eigen::Vector3d y_axis = z_axis.cross(x_axis);
+    Eigen::Vector3d forward =
+        -cam_dir;  // Camera looks toward origin in XY plane
+    forward.z() = 0;
+    forward.normalize();
 
-    pose.linear().col(0) = x_axis;
-    pose.linear().col(1) = y_axis;
-    pose.linear().col(2) = z_axis;
-    pose.translation() = cam_position;
+    double angle = std::atan2(forward.y(), forward.x());
+    pose.linear() = Eigen::AngleAxisd(-M_PI / 2, Eigen::Vector3d::UnitX())
+                        .toRotationMatrix();
   }
+
   return sample_poses;
 }
 
@@ -115,12 +119,14 @@ std::vector<Eigen::Vector2d> generate_pixels(
     const Eigen::Matrix3d& K,
     const Eigen::Isometry3d& world_to_cam) {
   std::vector<Eigen::Vector2d> pixels(points.size());
-  Eigen::Matrix<double, 3, 4> perspective_projection;
 
   for (int i = 0; i < points.size(); ++i) {
     const Eigen::Vector3d point_in_cam = world_to_cam * points[i];
-    const double x_normalized = -point_in_cam.x() / point_in_cam.z();
-    const double y_normalized = -point_in_cam.y() / point_in_cam.z();
+    if (point_in_cam.z() <= 0) {
+      std::cout << "Warning, point behind camera: " << i << std::endl;
+    }
+    const double x_normalized = point_in_cam.x() / point_in_cam.z();
+    const double y_normalized = point_in_cam.y() / point_in_cam.z();
 
     const Eigen::Vector3d pixel_homogeneous =
         K * Eigen::Vector3d(x_normalized, y_normalized, 1.0);
@@ -155,11 +161,14 @@ void exportToXYZ(const std::vector<Eigen::Vector3d>& points,
 void exportPoseToBlender(const Eigen::Isometry3d& pose,
                          const std::string& filename) {
   std::ofstream file(filename);
-  auto quat = Eigen::Quaterniond(pose.rotation());
-  file << "x,y,z,R_x,R_y,R_z,R_w" << std::endl;
+
+  Eigen::AngleAxisd rot(M_PI, Eigen::Vector3d(0, 1, 0));
+  const Eigen::Quaterniond quat(rot * pose.rotation());
+
+  file << "x,y,z,R_w,R_x,R_y,R_z" << std::endl;
   file << std::fixed << std::setprecision(4) << pose.translation().x() << ","
        << pose.translation().y() << "," << pose.translation().z() << ","
-       << quat.x() << "," << quat.y() << "," << quat.z() << "," << quat.w()
+       << quat.w() << "," << quat.x() << "," << quat.y() << "," << quat.z()
        << std::endl;
   file.close();
 }
@@ -172,16 +181,16 @@ struct SimpleReprojectionError {
 
   template <typename T>
   bool operator()(const T* const camera,
-                  const T* const point,
+                  const T* const point_world,
                   T* residuals) const {
     T p[3];
-    ceres::AngleAxisRotatePoint(camera, point, p);
+    ceres::AngleAxisRotatePoint(camera, point_world, p);
     p[0] += camera[3];
     p[1] += camera[4];
     p[2] += camera[5];
 
-    T x_pred = -p[0] / p[2];
-    T y_pred = -p[1] / p[2];
+    T x_pred = p[0] / p[2];
+    T y_pred = p[1] / p[2];
 
     residuals[0] = x_pred - x_observed;
     residuals[1] = y_pred - y_observed;
@@ -200,7 +209,7 @@ struct SimpleReprojectionError {
 int main() {
   printf("Testing Caspar \n");
 
-  constexpr int num_points = 100;
+  constexpr int num_points = 50;
   constexpr int num_poses = 2;
   constexpr int num_observations = num_poses * num_points;
   constexpr double epsilon_solver = 0.01;
@@ -211,15 +220,23 @@ int main() {
   const auto cam1_pose_gt = gt_poses[0];
   const auto cam2_pose_gt = gt_poses[1];
 
+  // Add after generating poses:
+  for (int i = 0; i < 5; ++i) {  // Check first few poses
+    Eigen::Vector3d cam_pos = gt_poses[i].translation();
+    Eigen::Vector3d cam_dir = gt_poses[i].linear().col(2);  // Forward direction
+    std::cout << "Camera " << i << ": pos=" << cam_pos.transpose()
+              << ", dir=" << cam_dir.transpose() << std::endl;
+  }
+
   auto initial_poses = perturbe_poses(gt_poses);
   auto cam1_pose_initial = initial_poses[0];
   auto cam2_pose_initial = initial_poses[1];
 
   auto initial_points = perturb_points(gt_points);
-  auto pixels_cam1 = perturb_pixels(generate_pixels(
-      gt_points, Eigen::Matrix3d::Identity(), cam1_pose_gt.inverse()));
-  auto pixels_cam2 = perturb_pixels(generate_pixels(
-      gt_points, Eigen::Matrix3d::Identity(), cam2_pose_gt.inverse()));
+  auto pixels_cam1 = perturb_pixels(
+      generate_pixels(gt_points, Eigen::Matrix3d::Identity(), cam1_pose_gt));
+  auto pixels_cam2 = perturb_pixels(
+      generate_pixels(gt_points, Eigen::Matrix3d::Identity(), cam2_pose_gt));
 
   std::unordered_map<size_t, Eigen::Vector2d> observationnr_to_pixel;
   std::unordered_map<size_t, size_t> observationnr_to_cam;
@@ -227,7 +244,7 @@ int main() {
   std::vector<Eigen::Matrix<double, 6, 1>> cam_params;
 
   for (int i = 0; i < num_poses; ++i) {
-    Eigen::Isometry3d world_to_cam = initial_poses[i].inverse();
+    Eigen::Isometry3d world_to_cam = initial_poses[i];
 
     Eigen::Matrix<double, 6, 1> params;
     params[3] = world_to_cam.translation().x();
@@ -274,7 +291,7 @@ int main() {
   }
 
   ceres_problem.SetParameterBlockConstant(cam_params[0].data());
-  // ceres_problem.SetParameterBlockConstant(initial_points[0].data());
+  ceres_problem.SetParameterBlockConstant(initial_points[0].data());
 
   ceres::Solver::Options ceres_options;
   ceres_options.max_num_iterations = 500;
@@ -292,5 +309,14 @@ int main() {
     std::cout << "Point " << i << " error: " << error << std::endl;
   }
 
+  // Caspar
+
+  caspar::SolverParams caspar_params;
+  caspar_params.solver_iter_max = ceres_options.max_num_iterations;
+
+  caspar::GraphSolver caspar_solver(
+      caspar_params, num_poses, num_points, num_observations);
+  caspar_solver.set_Point_nodes_from_stacked_host(
+      initial_poses.data(), 0, initial_poses.size());
   return 0;
 }
