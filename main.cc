@@ -30,7 +30,7 @@
 #define MEAN_POSE_DIST 4 * SPHERE_RADIUS
 
 #define POINT_NOISE_MEAN 0.1
-#define POINT_NOISE_STD 0.3
+#define POINT_NOISE_STD 0.2
 
 #define TRANSLATION_NOISE_MEAN 0.0
 #define TRANSLATION_NOISE_STD 0.03
@@ -246,6 +246,7 @@ int main() {
   std::unordered_map<size_t, size_t> observationnr_to_cam;
   std::vector<size_t> observationnr_to_point_index(num_observations);
   std::vector<Eigen::Matrix<double, 6, 1>> cam_params;
+  std::vector<Eigen::Matrix<double, 7, 1>> cam_params_caspar;
 
   for (int i = 0; i < num_poses; ++i) {
     Eigen::Isometry3d world_to_cam = initial_poses[i];
@@ -263,6 +264,23 @@ int main() {
     params[2] = axis_angle[2];
 
     cam_params.push_back(params);
+  }
+
+  for (int i = 0; i < num_poses; ++i) {
+    Eigen::Isometry3d world_to_cam = initial_poses[i];
+
+    Eigen::Quaterniond rot(world_to_cam.rotation());
+
+    Eigen::Matrix<double, 7, 1> params;
+    params[0] = rot.x();
+    params[1] = rot.y();
+    params[2] = rot.z();
+    params[3] = rot.w();
+    params[4] = world_to_cam.translation().x();
+    params[5] = world_to_cam.translation().y();
+    params[6] = world_to_cam.translation().z();
+
+    cam_params_caspar.push_back(params);
   }
 
   for (int i = 0; i < num_points; ++i) {
@@ -301,12 +319,33 @@ int main() {
         CasparCostFnType::REPROJECTION_SIMPLE,
         CasparLossFnType::L2,
         pixel,
-        cam_params[observationnr_to_cam[i]].data(),
+        cam_params_caspar[observationnr_to_cam[i]].data(),
         initial_points[observationnr_to_point_index[i]].data());
   }
 
+  // Ceres Priors
   ceres_problem.SetParameterBlockConstant(cam_params[0].data());
   ceres_problem.SetParameterBlockConstant(initial_points[0].data());
+
+  // Caspar Priors
+  double dist_poses = cam_params_caspar[0][4] - cam_params_caspar[1][4];
+  double* dist_poses_ptr = &dist_poses;
+  double anchor_pos1[] = {cam_params_caspar[0][4],
+                          cam_params_caspar[0][5],
+                          cam_params_caspar[0][6]};
+
+  adapter.AddResidualBlock(CasparCostFnType::POSITION_PRIOR,
+                           CasparLossFnType::L2,
+                           nullptr,
+                           cam_params_caspar[0].data(),
+                           anchor_pos1);
+  adapter.AddResidualBlock(CasparCostFnType::DISTANCE_PRIOR,
+                           CasparLossFnType::L2,
+                           nullptr,
+                           cam_params_caspar[0].data(),
+                           cam_params_caspar[1].data(),
+                           dist_poses_ptr);
+
   ceres::Solver::Options ceres_options;
   ceres_options.max_num_iterations = 500;
   ceres_options.linear_solver_type = ceres::DENSE_SCHUR;
@@ -325,7 +364,7 @@ int main() {
 
   std::cout << "Solving with Caspar" << std::endl;
   caspar::GraphSolver caspar_solver(
-      params, num_poses * 100, num_points * 200, num_observations * 200);
+      params, num_poses, num_points, num_observations, 1, 1);
   adapter.LoadToCaspar(caspar_solver);
   caspar_solver.solve(true);
   std::vector<float> caspar_solved_points(3 * num_points);

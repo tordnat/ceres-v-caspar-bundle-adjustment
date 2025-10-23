@@ -7,7 +7,13 @@
 
 #include "generated/solver.h"
 
-enum class CasparCostFnType { REPROJECTION_SIMPLE, REPROJECTION, UNKNOWN };
+enum class CasparCostFnType {
+  REPROJECTION_SIMPLE,
+  REPROJECTION,
+  POSITION_PRIOR,
+  DISTANCE_PRIOR,
+  UNKNOWN
+};
 enum class CasparLossFnType { L2, UNKNOWN };
 
 class CeresToCasparAdapter {
@@ -29,9 +35,33 @@ class CeresToCasparAdapter {
       return false;
     }
     if (cost_fn == CasparCostFnType::REPROJECTION_SIMPLE) {
-      AddSimpleReprojectionFactor(observed_values, x0, xs...);
+      if constexpr (sizeof...(Ts) == 1) {
+        AddSimpleReprojectionFactor(observed_values, x0, xs...);
+      } else {
+        std::cerr << "REPROJECTION_SIMPLE expects 1 additional parameter"
+                  << std::endl;
+        return false;
+      }
+    } else if (cost_fn == CasparCostFnType::POSITION_PRIOR) {
+      if constexpr (sizeof...(Ts) == 1) {
+        AddPositionPrior(x0, xs...);
+      } else {
+        std::cerr << "POSITION_PRIOR expects 1 additional parameter"
+                  << std::endl;
+        return false;
+      }
+    } else if (cost_fn == CasparCostFnType::DISTANCE_PRIOR) {
+      if constexpr (sizeof...(Ts) == 2) {
+        AddDistancePrior(x0, xs...);
+      } else {
+        std::cerr << "DISTANCE_PRIOR expects 2 additional parameters"
+                  << std::endl;
+        return false;
+      }
+    } else {
+      std::cerr << "Unknown or unsupported cost function type" << std::endl;
+      return false;
     }
-
     return true;
   }
   void LoadToCaspar(caspar::GraphSolver& solver);
@@ -105,10 +135,61 @@ class CeresToCasparAdapter {
     std::cout << "Finished loading data to Caspar" << std::endl;
   }
 
+  void AddPositionPrior(double* cam, double* position_anchor) {
+    auto cam_idx = AddOrGetSimpleReprojectionCam(cam);
+    for (int i = 0; i < POSITION_SIZE; i++) {
+      position_prior_positions_.push_back(position_anchor[0]);
+    }
+    position_prior_cam_idx_.push_back(cam_idx);
+    num_position_priors_++;
+  }
+
+  void LoadAllPositionPriors(caspar::GraphSolver& solver) {
+    if (num_position_priors_ < 1) {
+      std::cout << "No position priors to be added" << std::endl;
+      return;
+    }
+    std::cout << "Loading position priors" << std::endl;
+
+    solver.set_position_prior_num(num_position_priors_);
+    solver.set_position_prior_position_anchor_data_from_stacked_host(
+        position_prior_positions_.data(), 0, num_position_priors_);
+    solver.set_position_prior_cam1_indices_from_host(
+        position_prior_cam_idx_.data(), num_position_priors_);
+  }
+
+  void AddDistancePrior(double* cam1,
+                        double* cam2,
+                        double* distance_constraint) {
+    auto cam1_idx = AddOrGetSimpleReprojectionCam(cam1);
+    auto cam2_idx = AddOrGetSimpleReprojectionCam(cam2);
+    distance_prior_distances_.push_back(*distance_constraint);
+    distance_prior_cam1_idx_.push_back(cam1_idx);
+    distance_prior_cam2_idx_.push_back(cam2_idx);
+    num_distance_priors_++;
+  }
+
+  void LoadAllDistancePriors(caspar::GraphSolver& solver) {
+    if (num_distance_priors_ < 1) {
+      std::cout << "No distance priors to be added" << std::endl;
+      return;
+    }
+    std::cout << "Loading distance priors" << std::endl;
+    solver.set_distance_prior_num(num_distance_priors_);
+    solver.set_distance_prior_dist_data_from_stacked_host(
+        distance_prior_distances_.data(), 0, num_distance_priors_);
+    solver.set_distance_prior_cam1_indices_from_host(
+        distance_prior_cam1_idx_.data(), num_distance_priors_);
+    solver.set_distance_prior_cam2_indices_from_host(
+        distance_prior_cam2_idx_.data(), num_distance_priors_);
+    std::cout << "Done loading distance priors" << std::endl;
+  }
+
   size_t num_observations_ = 0;
 
   static constexpr int PIXEL_SIZE = 2;
   static constexpr int POINT_SIZE = 3;
+  static constexpr int POSITION_SIZE = 3;
 
   // Simple Reprojection Factor
   size_t simple_reproj_count_ = 0;
@@ -122,4 +203,15 @@ class CeresToCasparAdapter {
   std::vector<float> simple_reproj_point_;
 
   static constexpr int SIMPLE_REPROJ_CAM_SIZE = 6;
+
+  // Position prior
+  size_t num_position_priors_ = 0;
+  std::vector<float> position_prior_positions_;
+  std::vector<unsigned int> position_prior_cam_idx_;
+
+  // Distance prior
+  size_t num_distance_priors_ = 0;
+  std::vector<float> distance_prior_distances_;
+  std::vector<unsigned int> distance_prior_cam1_idx_;
+  std::vector<unsigned int> distance_prior_cam2_idx_;
 };
