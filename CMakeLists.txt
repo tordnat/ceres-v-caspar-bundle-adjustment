@@ -21,7 +21,7 @@ target_link_libraries(caspar_lib_core INTERFACE CUDA::cudart)
 
 
 
-add_executable(caspar_test main.cc)
+add_executable(caspar_test main.cc ceres_adapter.cc)
 set_target_properties(caspar_test PROPERTIES CXX_STANDARD 17)
 target_include_directories(caspar_test PRIVATE ${EIGEN3_INCLUDE_DIR})
 target_link_libraries(caspar_test PRIVATE 

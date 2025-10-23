@@ -3,9 +3,11 @@
 #include <iomanip>
 #include <ostream>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "ceres/solver.h"
+#include "ceres_adapter.h"
 #include "generated/solver.h"
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -17,6 +19,7 @@
 #include <Eigen/src/Geometry/Transform.h>
 #include <ceres/autodiff_cost_function.h>
 #include <ceres/loss_function.h>
+#include <ceres/problem.h>
 #include <ceres/rotation.h>
 #include <ceres/types.h>
 #include <solver_params.h>
@@ -26,8 +29,8 @@
 #define SPHERE_RADIUS 4
 #define MEAN_POSE_DIST 4 * SPHERE_RADIUS
 
-#define POINT_NOISE_MEAN 0.03
-#define POINT_NOISE_STD 0.1
+#define POINT_NOISE_MEAN 0.1
+#define POINT_NOISE_STD 0.3
 
 #define TRANSLATION_NOISE_MEAN 0.0
 #define TRANSLATION_NOISE_STD 0.03
@@ -106,7 +109,8 @@ std::vector<Eigen::Isometry3d> perturbe_poses(
     Eigen::Vector3d trans_noise;
     trans_noise << trans_dist(gen), trans_dist(gen), trans_dist(gen);
 
-    Sophus::SO3<double> rot_pertubation = Sophus::SO3d::exp(rot_noise);
+    Sophus::SO3<double> rot_pertubation =
+        Sophus::SO3d::exp(rot_noise);  // Should be skew symmetric?
 
     pose.linear() = pose.linear() * rot_pertubation.matrix();
     pose.translation() += trans_noise;
@@ -274,25 +278,35 @@ int main() {
   exportToXYZ(initial_points, "sphere_points_noisy.csv");
   exportPoseToBlender(cam1_pose_gt, "cam1_pose_gt.csv");
   exportPoseToBlender(cam2_pose_gt, "cam2_pose_gt.csv");
-  caspar::SolverParams params;
 
   // Using Ceres Solver
 
   ceres::Problem ceres_problem;
+  CeresToCasparAdapter adapter;
+  caspar::SolverParams params;
+
   for (int i = 0; i < num_observations; ++i) {
     const auto& point_obs = observationnr_to_pixel[i];
     ceres::CostFunction* cost_function =
         SimpleReprojectionError::Create(point_obs.x(), point_obs.y());
+    double pixel[2];
+    pixel[0] = point_obs.x();
+    pixel[1] = point_obs.y();
     ceres_problem.AddResidualBlock(
         cost_function,
         nullptr /* squared loss */,
+        cam_params[observationnr_to_cam[i]].data(),
+        initial_points[observationnr_to_point_index[i]].data());
+    adapter.AddResidualBlock(
+        CasparCostFnType::REPROJECTION_SIMPLE,
+        CasparLossFnType::L2,
+        pixel,
         cam_params[observationnr_to_cam[i]].data(),
         initial_points[observationnr_to_point_index[i]].data());
   }
 
   ceres_problem.SetParameterBlockConstant(cam_params[0].data());
   ceres_problem.SetParameterBlockConstant(initial_points[0].data());
-
   ceres::Solver::Options ceres_options;
   ceres_options.max_num_iterations = 500;
   ceres_options.linear_solver_type = ceres::DENSE_SCHUR;
@@ -309,14 +323,21 @@ int main() {
     std::cout << "Point " << i << " error: " << error << std::endl;
   }
 
-  // Caspar
-
-  caspar::SolverParams caspar_params;
-  caspar_params.solver_iter_max = ceres_options.max_num_iterations;
-
+  std::cout << "Solving with Caspar" << std::endl;
   caspar::GraphSolver caspar_solver(
-      caspar_params, num_poses, num_points, num_observations);
-  caspar_solver.set_Point_nodes_from_stacked_host(
-      initial_poses.data(), 0, initial_poses.size());
+      params, num_poses * 100, num_points * 200, num_observations * 200);
+  adapter.LoadToCaspar(caspar_solver);
+  caspar_solver.solve(true);
+  std::vector<float> caspar_solved_points(3 * num_points);
+  std::vector<Eigen::Vector3d> caspar_solved_points_eig;
+  caspar_solver.get_Point_nodes_to_stacked_host(
+      caspar_solved_points.data(), 0, num_points);
+
+  for (int i = 0; i < num_points; i++) {
+    caspar_solved_points_eig.emplace_back(caspar_solved_points[i * 3],
+                                          caspar_solved_points[i * 3 + 1],
+                                          caspar_solved_points[i * 3 + 2]);
+  }
+  exportToXYZ(caspar_solved_points_eig, "sphere_points_solved_caspar.csv");
   return 0;
 }
