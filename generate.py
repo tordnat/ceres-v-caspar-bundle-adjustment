@@ -44,24 +44,18 @@ def simple_pinhole(
 
 
 @caslib.add_factor
-def position_prior(
-  cam1: T.Annotated[PinholeIdeal, mem.Tunable],
-  position_anchor: T.Annotated[sf.V3, mem.Constant],
-)->sf.V3:
-  cam1_position = sf.V3(cam1.cam_T_world.t)
-  return position_anchor - cam1_position
-
-
-@caslib.add_factor
-def distance_prior(
-  cam1: T.Annotated[PinholeIdeal, mem.Tunable],
-  cam2: T.Annotated[PinholeIdeal, mem.Tunable],
-  dist: T.Annotated[float, mem.Constant],
-)->float:
-  pose1_x = cam1.cam_T_world.t[0]
-  pose2_x = cam2.cam_T_world.t[0]
-  cam_dist = pose2_x - pose1_x
-  return dist - cam_dist
+def simple_pinhole_fixed_cam(
+    cam: T.Annotated[PinholeIdeal, mem.Constant],
+    point: T.Annotated[Point, mem.Tunable],
+    pixel: T.Annotated[Pixel, mem.Constant],
+)->sf.V2:
+    focal_length = 1
+    point_cam = cam.cam_T_world * point
+    depth = point_cam[2]
+    point_ideal_camera_coords = sf.V2(point_cam[:2])/(depth + sf.epsilon() * sf.sign_no_zero(depth))
+    pixel_projected = focal_length  * point_ideal_camera_coords
+    reprojection_error = pixel_projected - pixel
+    return reprojection_error
 
 
 out_dir = Path(__file__).resolve().parent / "generated"
